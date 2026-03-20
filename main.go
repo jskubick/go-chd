@@ -2,9 +2,14 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,15 +19,22 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/bodgit/sevenzip"
-
-	"log/slog"
-
 	"github.com/schollz/progressbar/v3"
+	"golang.org/x/sys/windows"
 )
 
 //https://go.dev/play/p/nE3HLTvMu3v
+
+const DBGADS bool = false // used to suppress error messages related to the reading and writing of NTFS alternate data streams
+
+type ADSResult struct {
+	Supported bool // volume supports named streams
+	Written   bool // Zone.Identifier was successfully written
+}
 
 func replaceExt(path string, newExt string) (newName string) {
 	dir := filepath.Dir(path)
@@ -119,17 +131,35 @@ func decompressZIP(zipFile string) bool {
 			panic(err)
 		}
 
+		// close the newly-extracted file
 		fileInArchive, err := f.Open()
 		if err != nil {
 			panic(err)
 		}
-
 		if _, err := io.Copy(dstFile, fileInArchive); err != nil {
 			panic(err)
 		}
+		if err := dstFile.Close(); err != nil {
+			panic(err)
+		}
+		if err := fileInArchive.Close(); err != nil {
+			panic(err)
+		}
 
-		dstFile.Close()
-		fileInArchive.Close()
+		// set the last-modified time of the file we just extracted to match what's in the archive
+		modTime := f.Modified
+		if modTime.IsZero() {
+			modTime = f.ModTime()
+		}
+		if !modTime.IsZero() {
+			if err := os.Chtimes(filePath, time.Now(), modTime); err != nil {
+				log.Error("Can't set extracted file mtime", "file", filePath, "error", err)
+			} else {
+				log.Info("modtime set", modTime)
+			}
+		} else {
+			log.Error("modTime.IsZero()")
+		}
 	}
 	log.Info("returning from func")
 	return true
@@ -310,6 +340,9 @@ func runCmd() (e error) {
 		return
 	}
 
+	var srcDir string
+	srcDir = curDir
+
 	zipHasCUEorISO := false
 	// sourceFormatExt := ""
 	for _, zip := range zips {
@@ -355,6 +388,10 @@ func runCmd() (e error) {
 				return
 			}
 		}
+
+		var fullPath string
+		fullPath = srcDir + "\\" + zip
+
 		var processFilename string
 		if len(cueFiles) > 0 {
 			log.Info("isoFiles > 0", "isofiles[0]", cueFiles[0])
@@ -378,6 +415,73 @@ func runCmd() (e error) {
 		// currDir2, _ := os.Getwd()
 
 		log.Info("exec", "cmd", commands, "dir", dir)
+
+		if DBGADS {
+			log.Info("Looking up HostURL ADS for ", fullPath)
+		}
+		hostURL, hasHostURL, err := readHostURLFromZoneIdentifier(fullPath)
+		if DBGADS {
+			if err != nil {
+				log.Error("Couldn't read Zone.Identifier", "file", zip, "error", err)
+			} else if hasHostURL {
+				fmt.Println("HostUrl:", hostURL)
+			} else {
+				log.Info("No HostUrl found", "file", zip)
+			}
+		}
+
+		var outputFilePath = filepath.Join(srcDir + "\\" + dir + ".chd")
+		zipfileModified, err := getLastModifiedTime(fullPath)
+		if DBGADS && (err != nil) {
+			fmt.Println("error:", err)
+		}
+
+		fi, err := os.Stat(fullPath)
+		if err != nil {
+			return err
+		}
+		zipfileSize := fi.Size() // int64, bytes
+		if DBGADS {
+			fmt.Println("original zipfile size: ", zipfileSize)
+		}
+
+		var chdDate string
+		chdDate = time.Now().Format("2006-01-02 15:04:05 -0700 MST")
+		if DBGADS {
+			fmt.Println("current time: ", chdDate)
+		}
+
+		zipfileHash, err := fileSHA256(fullPath)
+
+		if DBGADS {
+			fmt.Println("SHA256:", zipfileHash)
+			fmt.Println("Original zipfile:", fullPath)
+			fmt.Println("Final output file:", outputFilePath)
+		}
+
+		var processFilenamePath = srcDir + "\\" + dir + "\\" + processFilename
+		if DBGADS {
+			fmt.Println("File being converted:", processFilenamePath)
+		}
+
+		fi, err = os.Stat(processFilenamePath)
+
+		var pFileSize int64
+
+		pFileSize = fi.Size()
+		if DBGADS {
+			fmt.Println("processed filename size:", pFileSize)
+		}
+
+		pFileHash, err := fileSHA256(processFilenamePath)
+		if DBGADS {
+			fmt.Println("processed filename hash:", pFileHash)
+		}
+
+		pFileLastModified, err := getLastModifiedTime(processFilenamePath)
+		if DBGADS {
+			fmt.Println("pFileDate:", pFileLastModified)
+		}
 
 		//Compressing, 86.9% complete... (ratio=25.8%)
 		// cmdCtx, cmdDone := context.WithCancel(context.Background())
@@ -441,7 +545,274 @@ func runCmd() (e error) {
 		}
 		log.Info("SUCCESS - Created CHD", "file", dir+".chd")
 		convertedToCHD++
+
+		// now, write all these values to the ADS
+		writeZoneIdentifier(outputFilePath, hostURL, chdDate, zip, zipfileSize, zipfileHash, zipfileModified, processFilename, pFileSize, pFileHash, pFileLastModified)
+
 	}
 	log.Info("Converted CHD files", "count", convertedToCHD, "CHD_Count", convertedToCHD, "ZIP_Count", len(zips))
+
 	return nil
+}
+
+func readHostURLFromZoneIdentifier(path string) (value string, found bool, err error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false, err
+	}
+
+	// Optional sanity check
+	if _, err := os.Stat(abs); err != nil {
+		return "", false, err
+	}
+
+	f, err := openADSForRead(abs + ":Zone.Identifier")
+	if err != nil {
+		if isWinFileNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "HostUrl=") {
+			v := strings.TrimPrefix(line, "HostUrl=")
+			v = strings.TrimRight(v, "\x00")
+			v = strings.TrimRight(v, "\r\n")
+			v = strings.TrimRight(v, "\n")
+
+			return v, true, nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", false, err
+	}
+
+	return "", false, nil
+}
+
+func openADSForRead(path string) (*os.File, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := windows.CreateFile(
+		p,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return os.NewFile(uintptr(h), path), nil
+}
+
+func isWinFileNotFound(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno == windows.ERROR_FILE_NOT_FOUND || errno == windows.ERROR_PATH_NOT_FOUND
+	}
+	return false
+}
+
+// returns the time the file was last modified
+func getLastModifiedTime(path string) (time.Time, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return fi.ModTime(), nil
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func writeZoneIdentifier(outputFilePath string, hostUrl string, chdCreationTime string, zipfileName string, zipfileSize int64, zipfileHash string, zipfileModificationTime time.Time, processFilename string, processFileSize int64, processFileHash string, processFileModificationTime time.Time, extraLines ...string) (ADSResult, error) {
+
+	if DBGADS {
+		fmt.Println("about to write Zone Identifier for ", outputFilePath)
+	}
+
+	abs, err := filepath.Abs(outputFilePath)
+	if err != nil {
+		if DBGADS {
+			log.Error("got an error")
+		}
+		return ADSResult{}, err
+	}
+
+	// Make sure the base file exists.
+	baseFile, err := openFileHandleForMetadata(abs)
+	if err != nil {
+		if DBGADS {
+			fmt.Println(fmt.Errorf("unable to write NTFS: %w", err))
+			return ADSResult{}, fmt.Errorf("unable to write NTFS: %w", err)
+		}
+	}
+
+	defer baseFile.Close()
+
+	supportsStreams, fsName, err := fileSupportsNamedStreams(baseFile)
+	if err != nil {
+		if DBGADS {
+			log.Info("output filesystem isn't NTFS, so can't add output stream (not a problem, unless the output file IS on a NTFS volume. Then... well, it probably IS a problem.")
+			return ADSResult{}, fmt.Errorf("check volume capabilities: %w", err)
+		}
+	}
+	if !supportsStreams {
+		// exFAT/FAT32/etc: clean "not supported", not a crash.
+		if DBGADS {
+			log.Info("output filesystem doesn't support streams. If it's NTFS, this is a problem. Otherwise, it's fine.")
+			return ADSResult{Supported: false, Written: false}, nil
+		}
+	}
+
+	adsPath := abs + ":Zone.Identifier"
+
+	adsFile, err := createADSForWrite(adsPath)
+	if err != nil {
+		// If the volume says it supports streams but the open still fails,
+		// return a real error so you can log/debug it.
+		if DBGADS {
+			log.Error("output filesystem says it supports ADS streams, but the attempt to open still failed.")
+			return ADSResult{}, fmt.Errorf("open ADS for write on %s (%s): %w", abs, fsName, err)
+		}
+	}
+	defer adsFile.Close()
+
+	lines := []string{
+		"[ZoneTransfer]",
+		"ZoneId=3",
+	}
+	for _, s := range extraLines {
+		if s != "" {
+			lines = append(lines, s)
+		}
+	}
+	if hostUrl != "" {
+		lines = append(lines, "HostUrl="+hostUrl)
+	} else {
+		lines = append(lines, "HostUrl=Unknown")
+	}
+
+	lines = append(lines, "zipfile-Name="+zipfileName)
+	lines = append(lines, fmt.Sprintf("zipfile-Size=%d", zipfileSize))
+	lines = append(lines, "zipfile-SHA256="+zipfileHash)
+	lines = append(lines, "zipfile-LastModified="+zipfileModificationTime.Format("2006-01-02 15:04:05 -0700 MST"))
+	lines = append(lines, "processedFile="+processFilename)
+	lines = append(lines, fmt.Sprintf("processedFile-Size=%d", processFileSize))
+	lines = append(lines, "processedFile-SHA256="+processFileHash)
+	lines = append(lines, "processedFile-LastModified="+processFileModificationTime.Format("2006-01-02 15:04:05 -0700 MST"))
+	lines = append(lines, "chd-CreationDate="+chdCreationTime)
+
+	// Windows text file style.
+	payload := strings.Join(lines, "\r\n") + "\r\n"
+	if DBGADS {
+		fmt.Println("About to write ADS payload:\n", payload)
+	}
+
+	if _, err := adsFile.WriteString(payload); err != nil {
+		return ADSResult{}, fmt.Errorf("write ADS: %w", err)
+	}
+	if err := adsFile.Sync(); err != nil {
+		return ADSResult{}, fmt.Errorf("flush ADS: %w", err)
+	}
+
+	if DBGADS {
+		log.Info("ADS updated")
+	}
+	return ADSResult{Supported: true, Written: true}, nil
+}
+
+func openFileHandleForMetadata(path string) (*os.File, error) {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := windows.CreateFile(
+		p,
+		0, // metadata only is fine
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return os.NewFile(uintptr(h), path), nil
+}
+
+func fileSupportsNamedStreams(f *os.File) (bool, string, error) {
+	var volName [windows.MAX_PATH + 1]uint16
+	var fsName [windows.MAX_PATH + 1]uint16
+	var serial uint32
+	var maxComponentLen uint32
+	var fsFlags uint32
+
+	err := windows.GetVolumeInformationByHandle(
+		windows.Handle(f.Fd()),
+		&volName[0],
+		uint32(len(volName)),
+		&serial,
+		&maxComponentLen,
+		&fsFlags,
+		&fsName[0],
+		uint32(len(fsName)),
+	)
+	if err != nil {
+		return false, "", err
+	}
+
+	name := windows.UTF16ToString(fsName[:])
+	return (fsFlags & windows.FILE_NAMED_STREAMS) != 0, name, nil
+}
+
+func createADSForWrite(adsPath string) (*os.File, error) {
+	p, err := windows.UTF16PtrFromString(adsPath)
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := windows.CreateFile(
+		p,
+		windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.CREATE_ALWAYS,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return os.NewFile(uintptr(h), adsPath), nil
 }
