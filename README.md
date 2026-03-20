@@ -10,9 +10,9 @@ I am not responsible for any loss of data. Use at your own risk.
 
 ===[Enhancements]===
 
-Did you know that whenever you download a file using Microsoft Edge (or, AFAIK, any Chrome-based browser), it adds a hidden NTFS record with the URL from which the file was downloaded?
+Did you know that whenever you download a file using Microsoft Edge (or, AFAIK, any Chrome-based browser), it adds a hidden (as in, "out of sight unless you care to look at it," not as in "secret") NTFS alternate data stream with the URL from which the file was downloaded?
 
-This info can really come in handy if you go nuts downloading legacy ROM files, then end up with hundreds of files with opaque names whose purpose isn't necessarily obvious. The problem is, if you convert the .zip file to .chd, that potentially helpful metadata goes up in smoke.
+This info can really come in handy if you go nuts downloading legacy ROM files for different platforms, then end up with hundreds of files with opaque names whose purpose isn't necessarily obvious. The problem is, if you convert the .zip file to .chd, that potentially helpful metadata goes up in smoke.
 
 My enhancements to the original program (which ultimately ended up dwarfing the original in size) add the following fields as a Zone.Identifier ADS:
 
@@ -43,4 +43,5 @@ The names are probably self-explanatory, but just in case...
 * processedFile-Size: its length in bytes
 * processedFile-LastModified: timestamps of the aforementioned processedFile, as indicated by metadata within the original archive.
 * chd-CreationDate: the timestamp when this program ran to create it.
+
 
